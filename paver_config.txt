@@ -1,0 +1,94 @@
+# PAVER Scheduler Config
+# Method: rb_ts
+paver_enabled 1
+paver_method rb_ts
+paver_task_stealing 1
+paver_num_partitions 1
+
+# TB Schedule (8 TBs)
+paver_tb_schedule 0,7,6,5,4,3,2,1
+
+# Partition definitions
+paver_partition 0 0,7,6,5,4,3,2,1
+
+# SM to partition mapping
+paver_sm_assign 0 0
+paver_sm_assign 1 
+paver_sm_assign 2 
+paver_sm_assign 3 
+paver_sm_assign 4 
+paver_sm_assign 5 
+paver_sm_assign 6 
+paver_sm_assign 7 
+paver_sm_assign 8 
+paver_sm_assign 9 
+paver_sm_assign 10 
+paver_sm_assign 11 
+paver_sm_assign 12 
+paver_sm_assign 13 
+paver_sm_assign 14 
+paver_sm_assign 15 
+paver_sm_assign 16 
+paver_sm_assign 17 
+paver_sm_assign 18 
+paver_sm_assign 19 
+paver_sm_assign 20 
+paver_sm_assign 21 
+paver_sm_assign 22 
+paver_sm_assign 23 
+paver_sm_assign 24 
+paver_sm_assign 25 
+paver_sm_assign 26 
+paver_sm_assign 27 
+paver_sm_assign 28 
+paver_sm_assign 29 
+paver_sm_assign 30 
+paver_sm_assign 31 
+paver_sm_assign 32 
+paver_sm_assign 33 
+paver_sm_assign 34 
+paver_sm_assign 35 
+paver_sm_assign 36 
+paver_sm_assign 37 
+paver_sm_assign 38 
+paver_sm_assign 39 
+paver_sm_assign 40 
+paver_sm_assign 41 
+paver_sm_assign 42 
+paver_sm_assign 43 
+paver_sm_assign 44 
+paver_sm_assign 45 
+paver_sm_assign 46 
+paver_sm_assign 47 
+paver_sm_assign 48 
+paver_sm_assign 49 
+paver_sm_assign 50 
+paver_sm_assign 51 
+paver_sm_assign 52 
+paver_sm_assign 53 
+paver_sm_assign 54 
+paver_sm_assign 55 
+paver_sm_assign 56 
+paver_sm_assign 57 
+paver_sm_assign 58 
+paver_sm_assign 59 
+paver_sm_assign 60 
+paver_sm_assign 61 
+paver_sm_assign 62 
+paver_sm_assign 63 
+paver_sm_assign 64 
+paver_sm_assign 65 
+paver_sm_assign 66 
+paver_sm_assign 67 
+paver_sm_assign 68 
+paver_sm_assign 69 
+paver_sm_assign 70 
+paver_sm_assign 71 
+paver_sm_assign 72 
+paver_sm_assign 73 
+paver_sm_assign 74 
+paver_sm_assign 75 
+paver_sm_assign 76 
+paver_sm_assign 77 
+paver_sm_assign 78 
+paver_sm_assign 79 
