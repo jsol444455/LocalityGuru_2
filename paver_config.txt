@@ -1,15 +1,15 @@
 # PAVER Scheduler Config
-# Method: rb_ts
+# Method: kway_ts
 paver_enabled 1
-paver_method rb_ts
+paver_method kway_ts
 paver_task_stealing 1
 paver_num_partitions 1
 
-# TB Schedule (8 TBs)
-paver_tb_schedule 0,7,6,5,4,3,2,1
+# TB Schedule (2 TBs)
+paver_tb_schedule 0,1
 
 # Partition definitions
-paver_partition 0 0,7,6,5,4,3,2,1
+paver_partition 0 0,1
 
 # SM to partition mapping
 paver_sm_assign 0 0
