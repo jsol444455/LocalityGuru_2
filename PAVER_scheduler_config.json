@@ -213,5 +213,5 @@
     33,
     17
   ],
-  "enable_task_stealing": true
+  "enable_task_stealing": false
 }
