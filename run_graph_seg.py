@@ -4,7 +4,7 @@ from paver_runtime_integration import PAVERPipeline, GPUArchitecture, Partitioni
 pipeline = PAVERPipeline()
 
 # Load your LocalityGuru output
-pipeline.load_locality_data("/home/m/LocalityGuru_2/img/gramschmidt/_Z19gramschmidt_kernel1PfS_S_i_8-1_matrix.json")
+pipeline.load_locality_data("/home/m/LocalityGuru_2/img/bicg/_Z12bicg_kernel2PfS_S__2-1_matrix.json")
 # OR load matrix directly
 # pipeline.load_locality_matrix(locality_matrix, kernel_name="GEMM")
 
@@ -12,7 +12,7 @@ pipeline.load_locality_data("/home/m/LocalityGuru_2/img/gramschmidt/_Z19gramschm
 pipeline.configure_gpu(GPUArchitecture.VOLTA, max_tb_per_sm=8)
 
 # Run partitioning (RB-TS recommended)
-result = pipeline.run_partitioning(PartitioningMethod.RB_TS)
+result = pipeline.run_partitioning(PartitioningMethod.KWAY_TS)
 
 # Export config for GPGPU-Sim
 pipeline.export_scheduler_config("paver_config.txt")
