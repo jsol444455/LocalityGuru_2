@@ -843,7 +843,7 @@ if __name__ == "__main__":
     result = pipeline.run_partitioning(PartitioningMethod.RB_TS)
     
     # Create and export config
-    pipeline.create_scheduler_config(enable_task_stealing=True)
+    pipeline.create_scheduler_config(enable_task_stealing=False)
     pipeline.export_scheduler_config("/home/claude/paver_scheduler_config.txt", format='gpgpu_sim')
     pipeline.export_scheduler_config("/home/claude/paver_scheduler_config.json", format='json')
     
