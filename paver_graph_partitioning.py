@@ -407,8 +407,26 @@ class METIS:
         n = graph.num_tbs
         
         if n <= n_partitions:
+            # Edge case: only 1 TB
+            if n <= 1:
+                return [[i for i in range(n)]]
+            
+            # Reduce partition count to ensure meaningful partitions
+            # Goal: at least 2 TB
+            n_partitions = max(1, n // 2)
+            
+            # If after adjustment we have more TBs than partitions, 
+            # fall through to normal algorithm
+            if n > n_partitions:
+                pass  # Continue to coarsening below
+            else:
+                # Simple balanced distribution for very small graphs
+                partitions = [[] for _ in range(n_partitions)]
+                for i in range(n):
+                    partitions[i % n_partitions].append(i)
+                return partitions
             # Each TB gets its own partition
-            return [[i] for i in range(n)]
+            # return [[i] for i in range(n)]
         
         # Phase 1: Coarsen the graph
         coarsened, mapping = METIS._coarsen(graph, n_partitions * 4)
@@ -705,9 +723,21 @@ class KWay_TS:
             PartitionResult containing the TB schedule and assignments
         """
         n_sms = self.config.num_sms
+        max_tb_per_sm = self.config.max_tb_per_sm
+        n_tbs = self.graph.num_tbs
+        
+        # FIX: Calculate appropriate number of partitions
+        # k should be the minimum of:
+        #   - Number of SMs (original paper assumption for large kernels)
+        #   - Number of partitions needed to hold all TBs (ceil(n_tbs / max_tb_per_sm))
+        # This ensures we don't create more partitions than necessary for small kernels
+        k = min(n_sms, max(1, (n_tbs + max_tb_per_sm - 1) // max_tb_per_sm))
+        
+        # Step 1: K-Way partition using METIS with corrected k
+        metis_partitions = METIS.partition_graph(self.graph, k)
         
         # Step 1: K-Way partition using METIS
-        metis_partitions = METIS.partition_graph(self.graph, n_sms)
+        # metis_partitions = METIS.partition_graph(self.graph, n_sms)
         
         # Step 2: Re-order TBs within each partition using MST
         partitions = []
