@@ -26,7 +26,9 @@ import os
 from paver_graph_partitioning import (
     LocalityGraph, GPUConfig, TBGroup, PartitionResult,
     PartitioningMethod, PAVERPartitioner, TaskStealer, SMState,
-    PrimMST, MST_TS, KWay_TS, RB_TS
+    PrimMST, MST_TS, KWay_TS, RB_TS,
+    # NEW: TSP-based schedulers (No METIS required)
+    NearestNeighborTSP, TwoOptImprovement, TSPSolver, TSP_TS, RB_TSP_TS
 )
 
 
