@@ -29,6 +29,8 @@ class PartitioningMethod(Enum):
     MST_TS = "mst_ts"
     KWAY_TS = "kway_ts"
     RB_TS = "rb_ts"
+    TSP_TS = "tsp_ts"           # NEW: Nearest Neighbor + 2-Opt TSP (No METIS required)
+    RB_TSP_TS = "rb_tsp_ts"     # NEW: RB-TS with TSP intra-partition ordering (No METIS required)
 
 
 @dataclass
@@ -301,12 +303,25 @@ class MST_TS:
         n_sms = self.config.num_sms
         n_tbs = len(mst_ordering)
         
+        if n_tbs <= n_sms:
+            # Edge case: fewer TBs than SMs, each TB is its own group
+            effective_x = 1
+        else:
+            # Calculate group size to create exactly n_sms initial groups
+            # This ensures every SM gets at least one initial group
+            effective_x = min(x, max(1, n_tbs // n_sms))
+        
+        # Debug output (optional, can be removed in production)
+        print(f"MST_TS: n_tbs={n_tbs}, n_sms={n_sms}, max_tb_per_sm={x}, effective_x={effective_x}")
+        
+        
+        
         partitions = []
         partition_assignment = {}
         sm_assignments = {sm: [] for sm in range(n_sms)}
         
         # Initial assignment: First (n_sms * x) TBs go as initial groups
-        initial_tbs = min(n_sms * x, n_tbs)
+        # initial_tbs = min(n_sms * x, n_tbs)
         
         current_idx = 0
         partition_id = 0
@@ -317,7 +332,7 @@ class MST_TS:
                 break
             
             # Take up to x TBs for initial group
-            group_end = min(current_idx + x, n_tbs)
+            group_end = min(current_idx + effective_x, n_tbs)
             group_tbs = mst_ordering[current_idx:group_end]
             
             if group_tbs:
@@ -367,6 +382,594 @@ class MST_TS:
             for tb_j in tb_list[i+1:]:
                 locality += self.graph.get_edge_weight(tb_i, tb_j)
         return locality
+
+# ==============================================================================
+# ==============================================================================
+# TSP-TS: Traveling Salesman Problem based TB Scheduler (No METIS Required)
+# Nearest Neighbor + 2-Opt Algorithm
+# ==============================================================================
+
+class NearestNeighborTSP:
+    """
+    Nearest Neighbor heuristic for solving TSP.
+    
+    This is a greedy algorithm that builds a tour by always visiting
+    the nearest unvisited city (TB). For maximum locality, we want
+    to MAXIMIZE edge weights, so we select the neighbor with highest weight.
+    
+    Time Complexity: O(n²)
+    Space Complexity: O(n)
+    
+    Key Advantage: No external dependencies - can be used when METIS is unavailable.
+    """
+    
+    @staticmethod
+    def solve(graph: LocalityGraph, start_node: Optional[int] = None) -> List[int]:
+        """
+        Solve TSP using Nearest Neighbor heuristic for MAXIMUM weight tour.
+        
+        Args:
+            graph: LocalityGraph to solve TSP on
+            start_node: Optional starting node (default: node with highest degree)
+            
+        Returns:
+            Ordered list of TB IDs representing the tour
+        """
+        n = graph.num_tbs
+        if n == 0:
+            return []
+        if n == 1:
+            return [0]
+        if n == 2:
+            return [0, 1]
+        
+        # Choose starting node: highest weighted degree (most data sharing)
+        if start_node is None:
+            weighted_degrees = []
+            for i in range(n):
+                degree = sum(graph.get_edge_weight(i, j) for j in range(n) if i != j)
+                weighted_degrees.append((degree, i))
+            start_node = max(weighted_degrees, key=lambda x: x[0])[1]
+        
+        # Build tour using nearest neighbor (maximum weight neighbor)
+        visited = [False] * n
+        tour = [start_node]
+        visited[start_node] = True
+        current = start_node
+        
+        for _ in range(n - 1):
+            best_next = -1
+            best_weight = -float('inf')
+            
+            for neighbor in range(n):
+                if not visited[neighbor]:
+                    weight = graph.get_edge_weight(current, neighbor)
+                    if weight > best_weight:
+                        best_weight = weight
+                        best_next = neighbor
+            
+            if best_next != -1:
+                tour.append(best_next)
+                visited[best_next] = True
+                current = best_next
+        
+        return tour
+    
+    @staticmethod
+    def compute_tour_weight(graph: LocalityGraph, tour: List[int]) -> float:
+        """
+        Compute total edge weight of consecutive pairs in tour.
+        
+        Args:
+            graph: LocalityGraph
+            tour: Ordered list of TB IDs
+            
+        Returns:
+            Total weight of consecutive edges
+        """
+        if len(tour) < 2:
+            return 0.0
+        
+        total = 0.0
+        for i in range(len(tour) - 1):
+            total += graph.get_edge_weight(tour[i], tour[i + 1])
+        
+        return total
+
+
+class TwoOptImprovement:
+    """
+    2-Opt local search improvement for TSP tours.
+    
+    2-Opt iteratively improves a tour by reversing segments to
+    remove crossing edges. For maximum weight TSP, we accept
+    reversals that INCREASE total tour weight.
+    
+    Time Complexity: O(n² × iterations)
+    Space Complexity: O(n)
+    """
+    
+    @staticmethod
+    def improve(graph: LocalityGraph, tour: List[int], 
+                max_iterations: int = 100,
+                improvement_threshold: float = 0.001) -> List[int]:
+        """
+        Improve tour using 2-Opt for MAXIMUM weight.
+        
+        Args:
+            graph: LocalityGraph
+            tour: Initial tour from Nearest Neighbor
+            max_iterations: Maximum improvement iterations
+            improvement_threshold: Minimum improvement ratio to continue
+            
+        Returns:
+            Improved tour
+        """
+        if len(tour) < 4:
+            return tour
+        
+        n = len(tour)
+        improved_tour = tour.copy()
+        best_weight = NearestNeighborTSP.compute_tour_weight(graph, improved_tour)
+        
+        for iteration in range(max_iterations):
+            improved = False
+            
+            for i in range(n - 2):
+                for j in range(i + 2, n):
+                    # Calculate weight change from 2-opt swap
+                    current_weight = graph.get_edge_weight(improved_tour[i], improved_tour[i + 1])
+                    if j + 1 < n:
+                        current_weight += graph.get_edge_weight(improved_tour[j], improved_tour[j + 1])
+                    
+                    new_weight = graph.get_edge_weight(improved_tour[i], improved_tour[j])
+                    if j + 1 < n:
+                        new_weight += graph.get_edge_weight(improved_tour[i + 1], improved_tour[j + 1])
+                    
+                    # If improvement found (higher weight is better for locality)
+                    if new_weight > current_weight:
+                        # Reverse segment between i+1 and j
+                        improved_tour[i + 1:j + 1] = reversed(improved_tour[i + 1:j + 1])
+                        improved = True
+            
+            if not improved:
+                break
+            
+            new_tour_weight = NearestNeighborTSP.compute_tour_weight(graph, improved_tour)
+            improvement_ratio = (new_tour_weight - best_weight) / max(best_weight, 1.0)
+            
+            if improvement_ratio < improvement_threshold:
+                break
+            
+            best_weight = new_tour_weight
+        
+        return improved_tour
+
+
+class TSPSolver:
+    """
+    Combined TSP solver using Nearest Neighbor + 2-Opt.
+    
+    This provides a complete, lightweight TSP solution without
+    requiring external libraries like METIS.
+    """
+    
+    @staticmethod
+    def solve(graph: LocalityGraph, 
+              use_2opt: bool = True,
+              max_2opt_iterations: int = 100) -> List[int]:
+        """
+        Solve TSP using Nearest Neighbor with optional 2-Opt improvement.
+        
+        Args:
+            graph: LocalityGraph to solve
+            use_2opt: Whether to apply 2-Opt improvement
+            max_2opt_iterations: Max iterations for 2-Opt
+            
+        Returns:
+            Optimized TB ordering
+        """
+        # Phase 1: Nearest Neighbor construction
+        tour = NearestNeighborTSP.solve(graph)
+        
+        if not use_2opt or len(tour) < 4:
+            return tour
+        
+        # Phase 2: 2-Opt improvement
+        improved_tour = TwoOptImprovement.improve(
+            graph, tour, max_iterations=max_2opt_iterations
+        )
+        
+        return improved_tour
+    
+    @staticmethod
+    def solve_with_multiple_starts(graph: LocalityGraph,
+                                   num_starts: int = 3,
+                                   use_2opt: bool = True) -> List[int]:
+        """
+        Run TSP solver from multiple starting points and return best tour.
+        
+        Args:
+            graph: LocalityGraph
+            num_starts: Number of different starting points to try
+            use_2opt: Whether to apply 2-Opt
+            
+        Returns:
+            Best tour found across all starts
+        """
+        n = graph.num_tbs
+        if n == 0:
+            return []
+        
+        # Select diverse starting points based on weighted degree
+        weighted_degrees = []
+        for i in range(n):
+            degree = sum(graph.get_edge_weight(i, j) for j in range(n) if i != j)
+            weighted_degrees.append((degree, i))
+        
+        # Sort and pick evenly distributed starting points
+        sorted_nodes = sorted(weighted_degrees, reverse=True)
+        step = max(1, len(sorted_nodes) // num_starts)
+        start_nodes = [sorted_nodes[i * step][1] for i in range(min(num_starts, n))]
+        
+        best_tour = None
+        best_weight = -float('inf')
+        
+        for start in start_nodes:
+            tour = NearestNeighborTSP.solve(graph, start_node=start)
+            if use_2opt and len(tour) >= 4:
+                tour = TwoOptImprovement.improve(graph, tour)
+            
+            weight = NearestNeighborTSP.compute_tour_weight(graph, tour)
+            if weight > best_weight:
+                best_weight = weight
+                best_tour = tour
+        
+        return best_tour if best_tour is not None else []
+
+
+# tsp ts:
+
+class TSP_TS:
+    """
+    TSP-based Thread Block Scheduler (TSP-TS).
+    
+    This scheduler uses Nearest Neighbor + 2-Opt TSP heuristics to order TBs
+    such that consecutive TBs have maximum data sharing. This is a lightweight
+    alternative to METIS-based approaches.
+    
+    Key Advantages:
+    - No METIS library required
+    - Considers path optimization, not just tree structure
+    - 2-Opt improvement provides local optimality
+    
+    Algorithm:
+    1. Solve TSP on locality graph using Nearest Neighbor
+    2. Improve solution using 2-Opt local search
+    3. Partition consecutive TBs into groups (ensuring all SMs get work)
+    4. Assign groups to SMs in round-robin fashion
+    """
+    
+    def __init__(self, graph: LocalityGraph, gpu_config: GPUConfig,
+                 use_2opt: bool = True, 
+                 max_2opt_iterations: int = 100,
+                 num_starts: int = 1):
+        """
+        Initialize TSP-TS scheduler.
+        
+        Args:
+            graph: LocalityGraph from LocalityGuru analysis
+            gpu_config: GPU hardware configuration
+            use_2opt: Enable 2-Opt improvement (recommended)
+            max_2opt_iterations: Maximum 2-Opt iterations per start
+            num_starts: Number of different starting points (1-5 recommended)
+        """
+        self.graph = graph
+        self.config = gpu_config
+        self.use_2opt = use_2opt
+        self.max_2opt_iterations = max_2opt_iterations
+        self.num_starts = num_starts
+    
+    def partition(self) -> PartitionResult:
+        """
+        Perform TSP-based partitioning.
+        
+        Returns:
+            PartitionResult containing the TB schedule and assignments
+        """
+        # Step 1: Get TSP ordering
+        if self.num_starts > 1:
+            tsp_ordering = TSPSolver.solve_with_multiple_starts(
+                self.graph, 
+                num_starts=self.num_starts,
+                use_2opt=self.use_2opt
+            )
+        else:
+            tsp_ordering = TSPSolver.solve(
+                self.graph,
+                use_2opt=self.use_2opt,
+                max_2opt_iterations=self.max_2opt_iterations
+            )
+        
+        # Step 2: Create TB groups
+        x = self.config.max_tb_per_sm
+        n_sms = self.config.num_sms
+        n_tbs = len(tsp_ordering)
+        
+        # =======================================================================
+        # FIX: Calculate effective group size to ensure ALL SMs get initial work
+        # =======================================================================
+        # This is the same fix we applied to MST_TS!
+        # When n_tbs < n_sms * x, we must reduce x to ensure N = n_sms groups
+        # =======================================================================
+        if n_tbs <= n_sms:
+            # Edge case: fewer TBs than SMs, each TB is its own group
+            effective_x = 1
+        else:
+            # Calculate group size to create exactly n_sms initial groups
+            effective_x = min(x, max(1, n_tbs // n_sms))
+        
+        print(f"TSP_TS: n_tbs={n_tbs}, n_sms={n_sms}, max_tb_per_sm={x}, effective_x={effective_x}")
+        
+        partitions = []
+        partition_assignment = {}
+        sm_assignments = {sm: [] for sm in range(n_sms)}
+        
+        current_idx = 0
+        partition_id = 0
+        
+        # Create initial groups of size effective_x for each SM
+        for sm in range(n_sms):
+            if current_idx >= n_tbs:
+                break
+            
+            group_end = min(current_idx + effective_x, n_tbs)
+            group_tbs = tsp_ordering[current_idx:group_end]
+            
+            if group_tbs:
+                locality = self._compute_group_locality(group_tbs)
+                group = TBGroup(group_tbs, partition_id, locality)
+                partitions.append(group)
+                sm_assignments[sm].append(group)
+                
+                for tb in group_tbs:
+                    partition_assignment[tb] = partition_id
+                
+                partition_id += 1
+            current_idx = group_end
+        
+        # Remaining TBs: assigned one at a time in round-robin
+        sm_idx = 0
+        while current_idx < n_tbs:
+            tb = tsp_ordering[current_idx]
+            group = TBGroup([tb], partition_id, 0.0)
+            partitions.append(group)
+            sm_assignments[sm_idx].append(group)
+            partition_assignment[tb] = partition_id
+            
+            partition_id += 1
+            sm_idx = (sm_idx + 1) % n_sms
+            current_idx += 1
+        
+        # Compute locality metrics
+        intra_locality = sum(p.total_locality for p in partitions)
+        total_locality = self.graph.get_total_edge_weight()
+        inter_cut = total_locality - intra_locality
+        
+        return PartitionResult(
+            method=PartitioningMethod.TSP_TS,
+            partitions=partitions,
+            tb_schedule=tsp_ordering,
+            partition_assignment=partition_assignment,
+            total_intra_partition_locality=intra_locality,
+            total_inter_partition_cut=inter_cut,
+            sm_assignments=sm_assignments
+        )
+    
+    def _compute_group_locality(self, tb_list: List[int]) -> float:
+        """Compute sum of edge weights within a TB group"""
+        locality = 0.0
+        for i, tb_i in enumerate(tb_list):
+            for tb_j in tb_list[i+1:]:
+                locality += self.graph.get_edge_weight(tb_i, tb_j)
+        return locality
+
+
+
+# RB_TSP_TS:
+
+# ==============================================================================
+# RB-TSP-TS: Recursive Bi-Partitioning with TSP Ordering (No METIS Required)
+# ==============================================================================
+
+class RB_TSP_TS:
+    """
+    Recursive Bi-Partitioning with TSP-based Intra-Partition Ordering (RB-TSP-TS).
+    
+    This is a hybrid approach that:
+    1. Uses simple recursive bi-partitioning (without METIS) for coarse grouping
+    2. Uses TSP (Nearest Neighbor + 2-Opt) for fine-grained ordering within partitions
+    
+    This provides:
+    - L2 locality from hierarchical partitioning structure
+    - L1 locality from optimal TSP-based ordering within partitions
+    - No external dependencies (no METIS required)
+    """
+    
+    def __init__(self, graph: LocalityGraph, gpu_config: GPUConfig,
+                 use_2opt: bool = True,
+                 max_2opt_iterations: int = 50):
+        """
+        Initialize RB-TSP-TS scheduler.
+        
+        Args:
+            graph: LocalityGraph from LocalityGuru analysis
+            gpu_config: GPU hardware configuration
+            use_2opt: Enable 2-Opt improvement for intra-partition ordering
+            max_2opt_iterations: Maximum 2-Opt iterations per partition
+        """
+        self.graph = graph
+        self.config = gpu_config
+        self.use_2opt = use_2opt
+        self.max_2opt_iterations = max_2opt_iterations
+    
+    def partition(self) -> PartitionResult:
+        """
+        Perform Recursive Bi-Partitioning with TSP intra-partition ordering.
+        
+        Returns:
+            PartitionResult containing the TB schedule and assignments
+        """
+        max_tb = self.config.max_tb_per_sm
+        n_sms = self.config.num_sms
+        
+        # Queue for BFS-style recursive partitioning
+        Q = deque()
+        L = []  # Final leaf TB groups
+        
+        # Initialize with full graph
+        initial_tbs = list(range(self.graph.num_tbs))
+        Q.append(initial_tbs)
+        
+        # Recursive bi-partitioning (without METIS)
+        while Q:
+            current_group = Q.popleft()
+            
+            if len(current_group) <= max_tb:
+                # This is a leaf node - order using TSP
+                if len(current_group) > 1:
+                    subgraph = self.graph.get_subgraph(current_group)
+                    local_ordering = TSPSolver.solve(
+                        subgraph,
+                        use_2opt=self.use_2opt,
+                        max_2opt_iterations=self.max_2opt_iterations
+                    )
+                    ordered_group = [current_group[i] for i in local_ordering]
+                    L.append(ordered_group)
+                else:
+                    L.append(current_group)
+            else:
+                # Bi-partition this group using simple greedy approach
+                subgraph = self.graph.get_subgraph(current_group)
+                part0, part1 = self._simple_bi_partition(subgraph)
+                
+                # Map back to original TB IDs
+                mapped_part0 = [current_group[i] for i in part0]
+                mapped_part1 = [current_group[i] for i in part1]
+                
+                # Add to queue for further processing
+                if len(mapped_part0) <= max_tb:
+                    if len(mapped_part0) > 1:
+                        sub0 = self.graph.get_subgraph(mapped_part0)
+                        local_order = TSPSolver.solve(sub0, use_2opt=self.use_2opt)
+                        L.append([mapped_part0[i] for i in local_order])
+                    else:
+                        L.append(mapped_part0)
+                else:
+                    Q.append(mapped_part0)
+                
+                if len(mapped_part1) <= max_tb:
+                    if len(mapped_part1) > 1:
+                        sub1 = self.graph.get_subgraph(mapped_part1)
+                        local_order = TSPSolver.solve(sub1, use_2opt=self.use_2opt)
+                        L.append([mapped_part1[i] for i in local_order])
+                    else:
+                        L.append(mapped_part1)
+                else:
+                    Q.append(mapped_part1)
+        
+        # Build result from leaf groups
+        partitions = []
+        tb_schedule = []
+        partition_assignment = {}
+        sm_assignments = {sm: [] for sm in range(n_sms)}
+        
+        for p_idx, group_tbs in enumerate(L):
+            locality = self._compute_partition_locality(group_tbs)
+            group = TBGroup(group_tbs, p_idx, locality)
+            partitions.append(group)
+            
+            sm_idx = p_idx % n_sms
+            sm_assignments[sm_idx].append(group)
+            
+            tb_schedule.extend(group_tbs)
+            for tb in group_tbs:
+                partition_assignment[tb] = p_idx
+        
+        # Compute locality metrics
+        intra_locality = sum(self._compute_partition_locality(list(g.tb_list)) 
+                            for g in partitions)
+        total_locality = self.graph.get_total_edge_weight()
+        inter_cut = total_locality - intra_locality
+        
+        return PartitionResult(
+            method=PartitioningMethod.RB_TSP_TS,
+            partitions=partitions,
+            tb_schedule=tb_schedule,
+            partition_assignment=partition_assignment,
+            total_intra_partition_locality=intra_locality,
+            total_inter_partition_cut=inter_cut,
+            sm_assignments=sm_assignments
+        )
+    
+    def _simple_bi_partition(self, graph: LocalityGraph) -> Tuple[List[int], List[int]]:
+        """
+        Simple bi-partitioning without METIS.
+        
+        Uses a greedy approach based on edge weights to split
+        the graph into two balanced parts.
+        """
+        n = graph.num_tbs
+        if n <= 2:
+            mid = n // 2
+            return list(range(mid)), list(range(mid, n))
+        
+        # Compute weighted degree for each node
+        degrees = []
+        for i in range(n):
+            degree = sum(graph.get_edge_weight(i, j) for j in range(n) if i != j)
+            degrees.append((degree, i))
+        
+        # Sort by degree
+        degrees.sort(reverse=True)
+        
+        # Greedy assignment to balance partitions while maximizing internal edges
+        part0 = []
+        part1 = []
+        target_size = n // 2
+        
+        for _, node in degrees:
+            # Calculate benefit of adding to each partition
+            benefit0 = sum(graph.get_edge_weight(node, p) for p in part0)
+            benefit1 = sum(graph.get_edge_weight(node, p) for p in part1)
+            
+            # Balance constraint
+            if len(part0) >= target_size + 1:
+                part1.append(node)
+            elif len(part1) >= target_size + 1:
+                part0.append(node)
+            elif benefit0 >= benefit1:
+                part0.append(node)
+            else:
+                part1.append(node)
+        
+        return part0, part1
+    
+    def _compute_partition_locality(self, tb_list: List[int]) -> float:
+        """Compute sum of edge weights within a partition"""
+        locality = 0.0
+        for i, tb_i in enumerate(tb_list):
+            for tb_j in tb_list[i+1:]:
+                locality += self.graph.get_edge_weight(tb_i, tb_j)
+        return locality
+
+
+
+
+
+
+
+
 
 
 # ==============================================================================
@@ -727,17 +1330,13 @@ class KWay_TS:
         n_tbs = self.graph.num_tbs
         
         # FIX: Calculate appropriate number of partitions
-        # k should be the minimum of:
-        #   - Number of SMs (original paper assumption for large kernels)
-        #   - Number of partitions needed to hold all TBs (ceil(n_tbs / max_tb_per_sm))
-        # This ensures we don't create more partitions than necessary for small kernels
-        k = min(n_sms, max(1, (n_tbs + max_tb_per_sm - 1) // max_tb_per_sm))
-        
+        # This ensures every SM gets at least one partition
+        k = max(n_sms, (n_tbs + max_tb_per_sm - 1) // max_tb_per_sm)
+        # Cap k at n_tbs (can't have more partitions than TBs)
+        k = min(k, n_tbs)
         # Step 1: K-Way partition using METIS with corrected k
         metis_partitions = METIS.partition_graph(self.graph, k)
         
-        # Step 1: K-Way partition using METIS
-        # metis_partitions = METIS.partition_graph(self.graph, n_sms)
         
         # Step 2: Re-order TBs within each partition using MST
         partitions = []
@@ -838,8 +1437,17 @@ class RB_TS:
         Returns:
             PartitionResult containing the TB schedule and assignments
         """
-        max_tb = self.config.max_tb_per_sm
         n_sms = self.config.num_sms
+        n_tbs = self.graph.num_tbs
+        
+        # FIX: Calculate effective max_tb to ensure we create at least num_sms partitions
+        # This handles the "small kernel" case from the PAVER paper where
+        # total TBs < total SM capacity
+        effective_max_tb = min(
+            self.config.max_tb_per_sm,
+            max(1, n_tbs // n_sms)  # Ensure at least 1 TB per partition
+        )
+        max_tb = effective_max_tb
         
         # Queue for BFS-style recursive partitioning
         Q = deque()
@@ -875,7 +1483,17 @@ class RB_TS:
                     L.append(part1)
                 else:
                     Q.append(part1)
-        
+        # FIX: Ensure we have at least num_sms partitions for load balancing
+        while len(L) < n_sms and any(len(p) > 1 for p in L):
+            # Find largest partition that can be split
+            largest_idx = max(
+                (i for i in range(len(L)) if len(L[i]) > 1),
+                key=lambda i: len(L[i])
+            )
+            to_split = L.pop(largest_idx)
+            mid = len(to_split) // 2
+            L.append(to_split[:mid])
+            L.append(to_split[mid:])
         # Create TBGroups and assign to SMs
         partitions = []
         tb_schedule = []
@@ -1073,7 +1691,7 @@ class PAVERPartitioner:
         self.graph = graph
         self.config = gpu_config
     
-    def partition(self, method: PartitioningMethod = PartitioningMethod.RB_TS) -> PartitionResult:
+    def partition(self, method: PartitioningMethod = PartitioningMethod.RB_TS, **kwargs) -> PartitionResult:
         """
         Partition the locality graph using the specified method.
         
@@ -1089,6 +1707,24 @@ class PAVERPartitioner:
             partitioner = KWay_TS(self.graph, self.config)
         elif method == PartitioningMethod.RB_TS:
             partitioner = RB_TS(self.graph, self.config)
+        #
+        elif method == PartitioningMethod.TSP_TS:
+            # Extract TSP-specific parameters
+            use_2opt = kwargs.get('use_2opt', True)
+            max_2opt_iterations = kwargs.get('max_2opt_iterations', 100)
+            num_starts = kwargs.get('num_starts', 1)
+            partitioner = TSP_TS(self.graph, self.config,
+                                use_2opt=use_2opt,
+                                max_2opt_iterations=max_2opt_iterations,
+                                num_starts=num_starts)
+        elif method == PartitioningMethod.RB_TSP_TS:
+            # Extract RB-TSP-TS specific parameters
+            use_2opt = kwargs.get('use_2opt', True)
+            max_2opt_iterations = kwargs.get('max_2opt_iterations', 50)
+            partitioner = RB_TSP_TS(self.graph, self.config,
+                                   use_2opt=use_2opt,
+                                   max_2opt_iterations=max_2opt_iterations) 
+        #
         else:
             raise ValueError(f"Unknown partitioning method: {method}")
         
@@ -1096,7 +1732,8 @@ class PAVERPartitioner:
     
     def partition_all(self) -> Dict[PartitioningMethod, PartitionResult]:
         """
-        Run all partitioning methods and return results for comparison.
+        Run all partitioning met
+hods and return results for comparison.
         
         Returns:
             Dict mapping method to its PartitionResult
