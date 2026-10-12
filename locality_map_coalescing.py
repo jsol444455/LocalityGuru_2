@@ -410,7 +410,19 @@ if __name__ == "__main__":
     parser.add_argument("-d",help="directory",default="syntax_tree/")
     parser.add_argument("-t",help="thread change",default="")
     parser.add_argument("-s",help="shared mode",default=0,type=int)
+    parser.add_argument("--param", action="append", default=[],
+                        help="scalar kernel parameter NAME=VALUE for the locality matrix "
+                             "(repeatable); NAME is the full name or its 'param_N' suffix, "
+                             "e.g. --param param_2=1 for 3DConvolution's plane index")
+    parser.add_argument("--ptx", default=None,
+                        help="PTX file for the locality matrix (default: original/<file>.ptx)")
     args = parser.parse_args()
+    import ptx_files.ptx_tracing as ptx_tracing
+    for item in args.param:
+        if "=" not in item:
+            parser.error(f"--param expects NAME=VALUE, got {item!r}")
+        ptx_tracing.launch_params[item.split("=", 1)[0].strip()] = item.split("=", 1)[1].strip()
+    ptx_tracing.ptx_path = args.ptx
     file_name = args.f
     dir_name = args.d
     change_th = args.t

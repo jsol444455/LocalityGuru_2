@@ -1,56 +1,200 @@
-import ptx_tracing
-from ptx_tracing import file_open,make_ctaid_map,tracing, OPERATE, ADD, MADLO, MUL, SHL, backprop_init
+# =============================================================================
+# ptx_files/ptx_tracing_string.py -- PTX opcode -> address-formula builders
+# =============================================================================
+# locality_guru.py imports this module for its op_dict (ADD, MADLO, SHL, ...):
+# each function turns the operands of one PTX instruction into a Python
+# expression string, which locality_map_coalescing.py later evaluates per
+# thread.
+#
+# The copy committed to LocalityGuru_2 (4228045) is not this module: it is a
+# copy of ptx_tracing_main.py that ends with an empty `if __name__ ==
+# "__main__":`, so `python3 locality_guru.py` stops with an IndentationError.
+# These functions were reconstructed instruction by instruction from the
+# compiled module committed next to it,
+# ptx_files/__pycache__/ptx_tracing_string.cpython-38.pyc (source lines 14-112),
+# and behave exactly like the compiled originals, including their quirks
+# (SQRT calls pow() with one argument, CLZ loops while a % 10 is non-zero),
+# except for two fixes in MADLO/MAD (mad.lo d, a, b, c = low 32 bits of a*b,
+# plus c):
+#   * the mask was 0x0000000011111111, which keeps only bits 0, 4, 8, ... of
+#     each nibble pair instead of the low 32 bits; it is now 0xFFFFFFFF;
+#   * the result is now parenthesised.  Without the parentheses an enclosing
+#     MUL/SHL bound to the last term only: mul.wide.s32 %rd, %r(mad), 4 gave
+#     "a*b + c*4" instead of "(a*b + c)*4".
+# These formulas feed the coalescing statistics of locality_map_coalescing.py.
+# The locality matrices no longer use them (see ptx_exec.py).
+# The rest of that module (OPERATE, tracing, file_open and the per-benchmark
+# *_init test drivers) is not used by locality_guru.py and is not included.
+# =============================================================================
+import os, sys
+import json
+import math
 
+param_dict = dict()
+tidx = 1
+tidy = 1
+ctaidy = 16
 
-tidx_list = list(range(0,16))
-tidy_list = list(range(0,16))
-ctaidy_list = list(range(0,ctaidy))
+tidx_list = list(range(0, 16))
+tidy_list = list(range(0, 16))
+ctaidy_list = list(range(0, ctaidy))
 ctaid_map = list()
 
 
-def backprop_init():
-    global tidx
-    global tidy
-    global ctaidx
-    global ctaidy
-    
-    tidx = 16
-    tidy = 16
-    ctaidx = 1
-    ctaidy = 1024
-
-    tidx_list = list(range(0,tidx)) #list(range(0,512))
-    tidy_list = list(range(0,tidy))
-    ctaidy_list = list(range(0,ctaidy))
-    ctaidx_list = list(range(0,ctaidx))
+def ADD(a, b):
+    return f"({a} + {b})"
 
 
-    param_dict["%ctaid.y"] = ctaidy_list #1024/16
-    param_dict["%tid.y"] = tidy_list #list(range(0,16))
-    param_dict["%tid.x"] = tidx_list #list(range(0,16))
-    param_dict["_Z22bpnn_layerforward_CUDAPfS_S_S_ii_param_0"] = [0]
-    param_dict["_Z22bpnn_layerforward_CUDAPfS_S_S_ii_param_2"] = [64*16+64]
-    param_dict["_Z22bpnn_layerforward_CUDAPfS_S_S_ii_param_5"] = [64*16*2]
-    param_dict["_Z24bpnn_adjust_weights_cudaPfiS_iS_S__param_0"] = [64*16*3]
-    param_dict["_Z24bpnn_adjust_weights_cudaPfiS_iS_S__param_2"] = [64*16*4]
-    param_dict["_Z24bpnn_adjust_weights_cudaPfiS_iS_S__param_5"] = [64*16*5]
-    param_dict["_Z24bpnn_adjust_weights_cudaPfiS_iS_S__param_4"] = [64*16*6]
-    param_dict["_Z24bpnn_adjust_weights_cudaPfiS_iS_S__param_1"] = [64*16*7]
-    param_dict["4"] = [4]
-    param_dict["16"] = [16]
-    param_dict["1"] = [1]
-    for i in range(ctaidy*ctaidx):
-        ctaid_map.append(list())
-        for j in range(ctaidy*ctaidx):
-            ctaid_map[i].append(0)
-    file_open("syntax_tree/rodinia/rodinia_backprop.json")
-    #res = OPERATE("%ctaid.y",OPERATE("_Z22bpnn_layerforward_CUDAPfS_S_S_ii_param_5","%tid.y",ADD),SHL)
+def ABS(a):
+    if a < 0:
+        a *= -1
+    return a
 
 
+def SUB(a, b):
+    return f"({a} - {b})"
 
 
-def main():
-    
-    backprop_init()
+def MADLO(a, b, c):
+    return f"((( {a} *  {b} )&0xFFFFFFFF) + {c})"
 
-if __name__== "__main__":
+
+def MAD(a, b, c):
+    return f"((( {a} *  {b} )&0xFFFFFFFF) + {c})"
+
+
+def MUL(a, b):
+    return f"({a} * {b})"
+
+
+def LD(a):
+    return f"{a}"
+
+
+def ST(a):
+    return f"{a}"
+
+
+def CVTA(a):
+    return f"{a}"
+
+
+def CVT(a):
+    return f"{a}"
+
+
+def MOV(a):
+    return f"{a}"
+
+
+def NOT(a):
+    return f"~{a}"
+
+
+def SHR(a, b):
+    return f"({a} >> {b})"
+
+
+def SHL(a, b):
+    return f"({a} << {b})"
+
+
+def OR(a, b):
+    return f"({a} | {b})"
+
+
+def AND(a, b):
+    return f"({a} & {b})"
+
+
+def DIV(a, b):
+    return f"({a} / {b})"
+
+
+def SELP(a, b, c):
+    if c == 1:
+        return f"{a}"
+    else:
+        return f"{b}"
+
+
+def SETP(a, b, c):
+    return SELP(a, b, c)
+
+
+def SETP_GE(a, b, c):
+    if c >= 1:
+        return f"{a}"
+    else:
+        return f"{b}"
+
+
+def SETP_LT(a, b, c):
+    if c < 1:
+        return f"{a}"
+    else:
+        return f"{b}"
+
+
+def SETP_NE(a, b, c):
+    if c != 1:
+        return f"{a}"
+    else:
+        return f"{b}"
+
+
+def SETP_GT(a, b, c):
+    if c > 1:
+        return f"{a}"
+    return f"{b}"
+
+
+def SETP_EQ(a, b, c):
+    if c == 1:
+        return f"{a}"
+    return f"{b}"
+
+
+def BFE(a, b, c):
+    return f"{a}"
+
+
+def PRMT(a, b, c):
+    return f"{a}"
+
+
+def SQRT(a):
+    return f"{pow(a)}"
+
+
+def MIN(a, b):
+    if a > b:
+        return f"{b}"
+    return f"{a}"
+
+
+def MAX(a, b):
+    if a < b:
+        return f"{b}"
+    return f"{a}"
+
+
+def NEG(a):
+    return f"{a * -1}"
+
+
+def CLZ(a):
+    cnt = 0
+    while a % 10:
+        cnt += 1
+        continue
+        break
+    return f"{cnt}"
+
+
+def RCP(a):
+    return f"(1/{a})"
+
+
+def REM(a):
+    return f"{a}"

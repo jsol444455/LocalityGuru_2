@@ -351,6 +351,12 @@ class SchedulerConfig:
     sm_assignments: Dict[int, List[int]]  # SM ID -> partition IDs
     tb_schedule: List[int]  # Flattened TB execution order
     enable_task_stealing: bool = True
+    # How GPGPU-Sim maps the SM numbers of sm_assignments to its SMs:
+    # None/"linear" = SM i is GPGPU-Sim SM i; "interleaved" = SM i is the i-th
+    # SM the stock dispatcher fills when it starts at cluster 0, as for the
+    # first kernel of a run (core 0 of every cluster first). None writes no
+    # line, which the simulator reads as "linear".
+    sm_order: Optional[str] = None
     
     def to_gpgpu_sim_format(self) -> str:
         """
@@ -364,6 +370,8 @@ class SchedulerConfig:
         lines.append(f"paver_enabled 1")
         lines.append(f"paver_method {self.method.value}")
         lines.append(f"paver_task_stealing {1 if self.enable_task_stealing else 0}")
+        if self.sm_order is not None:
+            lines.append(f"paver_sm_order {self.sm_order}")
         lines.append(f"paver_num_partitions {self.num_partitions}")
         lines.append("")
         
@@ -388,7 +396,7 @@ class SchedulerConfig:
     
     def to_dict(self) -> Dict[str, Any]:
         """Export as dictionary for JSON serialization"""
-        return {
+        d = {
             "method": self.method.value,
             "num_partitions": self.num_partitions,
             "partition_list": self.partition_list,
@@ -396,33 +404,74 @@ class SchedulerConfig:
             "tb_schedule": self.tb_schedule,
             "enable_task_stealing": self.enable_task_stealing
         }
+        if self.sm_order is not None:
+            d["sm_order"] = self.sm_order
+        return d
+
+
+SM_ORDERS = (None, "linear", "interleaved")
 
 
 def create_scheduler_config(result: PartitionResult, 
-                           enable_task_stealing: bool = True) -> SchedulerConfig:
+                           enable_task_stealing: bool = True,
+                           sm_order: Optional[str] = None) -> SchedulerConfig:
     """
     Create scheduler configuration from partition result.
     
     Args:
         result: PartitionResult from graph partitioning
         enable_task_stealing: Whether to enable task stealing
+        sm_order: None (no line, same as "linear") or "interleaved", see
+            SchedulerConfig.sm_order
         
     Returns:
         SchedulerConfig ready for export
     """
+    if sm_order not in SM_ORDERS:
+        raise ValueError(f"sm_order must be one of {SM_ORDERS}, got {sm_order!r}")
     partition_list = [list(p.tb_list) for p in result.partitions]
-    sm_assignments = {
-        sm_id: [g.partition_id for g in groups]
-        for sm_id, groups in result.sm_assignments.items()
-    }
-    
+
+    # 'paver_partition <i>' lines are numbered by list position, and GPGPU-Sim
+    # indexes its partition table by that position. Map each SM's groups to
+    # their position, not to TBGroup.partition_id: several groups may share a
+    # partition_id (e.g. chunks of one METIS part), and ids need not be dense.
+    position = {id(g): i for i, g in enumerate(result.partitions)}
+    sm_assignments = {}
+    for sm_id, groups in result.sm_assignments.items():
+        idx = []
+        for g in groups:
+            if id(g) not in position:
+                raise ValueError(f"SM {sm_id} is assigned a TB group that is "
+                                 f"not in result.partitions: {g.tb_list}")
+            idx.append(position[id(g)])
+        sm_assignments[sm_id] = idx
+
+    # The simulator issues exactly the TBs reachable through sm_assignments,
+    # so every TB of the grid must be reachable exactly once.
+    issued = [tb for idx in sm_assignments.values()
+              for i in idx for tb in partition_list[i]]
+    counts = {}
+    for tb in issued:
+        counts[tb] = counts.get(tb, 0) + 1
+    duplicated = sorted(tb for tb, c in counts.items() if c > 1)
+    n_tbs = len(result.tb_schedule)
+    missing = sorted(set(range(n_tbs)) - set(counts))
+    out_of_range = sorted(tb for tb in counts if tb < 0 or tb >= n_tbs)
+    if duplicated or missing or out_of_range:
+        raise ValueError(
+            f"Invalid {result.method.value} schedule: "
+            f"{len(duplicated)} TBs assigned more than once {duplicated[:10]}, "
+            f"{len(missing)} never assigned {missing[:10]}, "
+            f"{len(out_of_range)} out of range {out_of_range[:10]}")
+
     return SchedulerConfig(
         method=result.method,
         num_partitions=len(result.partitions),
         partition_list=partition_list,
         sm_assignments=sm_assignments,
         tb_schedule=result.tb_schedule,
-        enable_task_stealing=enable_task_stealing
+        enable_task_stealing=enable_task_stealing,
+        sm_order=sm_order
     )
 
 
@@ -682,12 +731,14 @@ class PAVERPipeline:
         print("\n" + partitioner.compare_methods())
         return partitioner.partition_all()
     
-    def create_scheduler_config(self, enable_task_stealing: bool = True) -> SchedulerConfig:
+    def create_scheduler_config(self, enable_task_stealing: bool = True,
+                                sm_order: Optional[str] = None) -> SchedulerConfig:
         """
         Create scheduler configuration from partitioning result.
         
         Args:
             enable_task_stealing: Whether to enable task stealing
+            sm_order: None (default) or "interleaved", see SchedulerConfig
             
         Returns:
             SchedulerConfig ready for export
@@ -697,7 +748,8 @@ class PAVERPipeline:
         
         self.scheduler_config = create_scheduler_config(
             self.partition_result, 
-            enable_task_stealing
+            enable_task_stealing,
+            sm_order
         )
         return self.scheduler_config
     

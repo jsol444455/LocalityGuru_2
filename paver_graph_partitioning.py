@@ -1016,6 +1016,10 @@ class METIS:
             
             # Reduce partition count to ensure meaningful partitions
             # Goal: at least 2 TB
+            # NOTE: this silently changes the requested k (16 TBs, k=16 -> 8
+            # parts of 2). It is why K-Way-TS put 2 TBs on each of 8 SMs for
+            # 16-TB kernels; K-Way-TS now uses kway_partition(). RB-TS only
+            # reaches this branch for n <= 2 with k = 2, so it is left as is.
             n_partitions = max(1, n // 2)
             
             # If after adjustment we have more TBs than partitions, 
@@ -1064,7 +1068,153 @@ class METIS:
             mid = len(result[0]) // 2
             return result[0][:mid], result[0][mid:]
         return result[0], result[1]
-    
+
+    @staticmethod
+    def kway_partition(graph: LocalityGraph, n_partitions: int,
+                       refine_passes: int = 8) -> List[List[int]]:
+        """
+        Balanced k-way partitioning used by K-Way-TS (PAVER Sec. 4.2).
+
+        PAVER: "k is the total number of partitions equal to the number of
+        SMs. We evenly partition the entire set of TBs to all the k SMs
+        considering data sharing", using METIS "to partition the graph in a
+        load-balanced manner while maximizing the sum of edge weights within
+        partitions".
+
+        Differences from partition_graph() (which RB-TS keeps using):
+          * the requested k is never changed;
+          * balance is strict: every part gets floor(n/k) or ceil(n/k) TBs.
+            For grids with fewer TBs than the GPU can hold at once,
+            GPGPU-Sim's shader_core_config::max_cta() lowers the number of
+            CTAs an SM may run at once to ceil(#TBs / #SMs), so a larger part
+            would run in serial waves on its SM while other SMs sit idle;
+          * if n <= k every TB is its own part, i.e. one TB per SM; all TBs
+            then start at kernel launch (the case PAVER Sec. 6.3 discusses
+            for kernels whose TBs all fit in the SMs at once).
+
+        Returns k lists (n lists when n <= k); every TB appears exactly once.
+        """
+        n = graph.num_tbs
+        if n == 0:
+            return []
+        k = max(1, int(n_partitions))
+        if k == 1:
+            return [list(range(n))]
+        if n <= k:
+            return [[i] for i in range(n)]
+
+        # Multi-level: coarsen, greedy initial partition, project back to TBs.
+        coarsened, mapping = METIS._coarsen(graph, k * 4)
+        coarse_parts = METIS._initial_partition(coarsened, k)
+        member = np.full(n, -1, dtype=np.int64)
+        for p_idx, coarse_part in enumerate(coarse_parts):
+            for coarse_node in coarse_part:
+                member[mapping[coarse_node]] = p_idx
+        if (member < 0).any():
+            raise RuntimeError("kway_partition: coarsening lost TBs "
+                               f"{np.nonzero(member < 0)[0].tolist()}")
+
+        adj = np.array(graph.adjacency_matrix, dtype=float)
+        np.fill_diagonal(adj, 0.0)
+        # w[v, p] = edge weight between TB v and the TBs currently in part p
+        onehot = np.zeros((n, k))
+        onehot[np.arange(n), member] = 1.0
+        w = adj @ onehot
+
+        lo, hi = n // k, -(-n // k)
+        METIS._rebalance_strict(adj, member, w, k, lo, hi)
+        METIS._refine_balanced(adj, member, w, k, lo, hi, refine_passes)
+
+        parts = [[] for _ in range(k)]
+        for v in range(n):
+            parts[int(member[v])].append(v)
+        return parts
+
+    @staticmethod
+    def _move_tb(adj: np.ndarray, member: np.ndarray, w: np.ndarray,
+                 sizes: np.ndarray, v: int, dst: int) -> None:
+        """Move TB v to part dst, keeping w and sizes consistent."""
+        src = int(member[v])
+        member[v] = dst
+        w[:, src] -= adj[:, v]
+        w[:, dst] += adj[:, v]
+        sizes[src] -= 1
+        sizes[dst] += 1
+
+    @staticmethod
+    def _rebalance_strict(adj: np.ndarray, member: np.ndarray, w: np.ndarray,
+                          k: int, lo: int, hi: int) -> None:
+        """
+        Move TBs until every part holds lo..hi TBs, each time taking the move
+        that loses the least intra-part edge weight. Every move strictly
+        reduces sum(max(0, size-hi) + max(0, lo-size)), so it terminates.
+        """
+        sizes = np.bincount(member, minlength=k)
+        while True:
+            over = sizes > hi
+            under = sizes < lo
+            if not over.any() and not under.any():
+                return
+            if over.any():
+                src_ok = over
+                dst_ok = under if under.any() else (sizes < hi)
+            else:
+                src_ok = sizes > lo
+                dst_ok = under
+            cand = np.nonzero(src_ok[member])[0]
+            dsts = np.nonzero(dst_ok)[0]
+            gains = w[np.ix_(cand, dsts)] - w[cand, member[cand]][:, None]
+            best = int(np.argmax(gains))
+            v = int(cand[best // len(dsts)])
+            METIS._move_tb(adj, member, w, sizes, v, int(dsts[best % len(dsts)]))
+
+    @staticmethod
+    def _refine_balanced(adj: np.ndarray, member: np.ndarray, w: np.ndarray,
+                         k: int, lo: int, hi: int, passes: int) -> None:
+        """
+        FM/KL-style refinement that never leaves the lo..hi size band:
+          1. single-TB moves with positive gain (source part above lo,
+             destination part below hi);
+          2. size-neutral pairwise swaps with positive gain -- the only
+             possible improvement when n is a multiple of k (lo == hi).
+        Each accepted step strictly increases intra-part weight.
+        """
+        n = member.shape[0]
+        sizes = np.bincount(member, minlength=k)
+        rows = np.arange(n)
+        eps = 1e-9
+        for _ in range(passes):
+            improved = False
+            for v in range(n):
+                p = int(member[v])
+                if sizes[p] <= lo:
+                    continue
+                dsts = np.nonzero(sizes < hi)[0]
+                dsts = dsts[dsts != p]
+                if dsts.size == 0:
+                    continue
+                gains = w[v, dsts] - w[v, p]
+                j = int(np.argmax(gains))
+                if gains[j] > eps:
+                    METIS._move_tb(adj, member, w, sizes, v, int(dsts[j]))
+                    improved = True
+            for v in range(n):
+                p = int(member[v])
+                # swap v (in p) with u (in q = member[u] != p):
+                # (w[v,q] - w[v,p]) + (w[u,p] - w[u,q]) - 2*adj[v,u]
+                gains = ((w[v, member] - w[v, p])
+                         + (w[:, p] - w[rows, member])
+                         - 2.0 * adj[v, :])
+                gains[member == p] = -np.inf
+                u = int(np.argmax(gains))
+                if gains[u] > eps:
+                    q = int(member[u])
+                    METIS._move_tb(adj, member, w, sizes, v, q)
+                    METIS._move_tb(adj, member, w, sizes, u, p)
+                    improved = True
+            if not improved:
+                return
+
     @staticmethod
     def _coarsen(graph: LocalityGraph, target_size: int) -> Tuple[LocalityGraph, Dict[int, List[int]]]:
         """
@@ -1131,9 +1281,11 @@ class METIS:
                     coarse_adj[cj, ci] = coarse_adj[ci, cj]
         
         coarse_graph = LocalityGraph(n_coarse, coarse_adj)
-        
-        # Recursively coarsen if still too large
-        if n_coarse > target_size:
+
+        # Recursively coarsen if still too large. Stop when this level made no
+        # progress (no edge could be matched, e.g. a kernel with no inter-TB
+        # sharing): recursing on an identical graph would never terminate.
+        if n_coarse > target_size and n_coarse < n:
             deeper_graph, deeper_map = METIS._coarsen(coarse_graph, target_size)
             # Compose mappings
             composed_map = {}
@@ -1320,60 +1472,65 @@ class KWay_TS:
     
     def partition(self) -> PartitionResult:
         """
-        Perform K-Way partitioning.
-        
+        Perform K-Way partitioning (PAVER Sec. 4.2).
+
+        * k = number of SMs ("k is the total number of partitions equal to the
+          number of SMs"). When the kernel has fewer TBs than SMs, the balanced
+          partition puts one TB in each of n_tbs parts: TB i runs on SM i,
+          for SMs 0..n_tbs-1, and the remaining SMs get nothing. RB-TS uses
+          the same SMs with one TB each, but in a different TB order. The LRR
+          baseline also runs one TB per SM, but only one per cluster (for the
+          first kernel of a run SMs 0, 2, 4, ... on the 2-core clusters of
+          the Titan V config), see 'paver_sm_order interleaved'.
+        * Parts are strictly balanced (floor/ceil of n_tbs / k TBs).
+        * The TB group of an SM is its whole partition, re-ordered with Prim's
+          MST so the TBs that run concurrently share the most data. The SM
+          executes it for the entire kernel; task stealing (runtime) balances
+          the tail.
+
         Returns:
             PartitionResult containing the TB schedule and assignments
         """
         n_sms = self.config.num_sms
-        max_tb_per_sm = self.config.max_tb_per_sm
         n_tbs = self.graph.num_tbs
-        
-        # FIX: Calculate appropriate number of partitions
-        # This ensures every SM gets at least one partition
-        k = max(n_sms, (n_tbs + max_tb_per_sm - 1) // max_tb_per_sm)
-        # Cap k at n_tbs (can't have more partitions than TBs)
-        k = min(k, n_tbs)
-        # Step 1: K-Way partition using METIS with corrected k
-        metis_partitions = METIS.partition_graph(self.graph, k)
-        
-        
-        # Step 2: Re-order TBs within each partition using MST
+
+        k = min(n_sms, n_tbs)
+        metis_partitions = METIS.kway_partition(self.graph, k)
+
         partitions = []
         tb_schedule = []
         partition_assignment = {}
         sm_assignments = {sm: [] for sm in range(n_sms)}
-        
-        for p_idx, tb_list in enumerate(metis_partitions):
+
+        for tb_list in metis_partitions:
             if not tb_list:
                 continue
-            
-            # Get subgraph for this partition
+
+            # Re-order the partition with Prim's MST (paper: "we re-order the
+            # TBs in each partition using Prim's MST")
             subgraph = self.graph.get_subgraph(tb_list)
-            
-            # Order TBs within partition using MST
             local_ordering = PrimMST.get_mst_ordering(subgraph)
             ordered_tbs = [tb_list[i] for i in local_ordering]
-            
-            # Compute intra-partition locality
-            locality = self._compute_partition_locality(ordered_tbs)
-            
-            # Create TB groups based on max_tb_per_sm
-            x = self.config.max_tb_per_sm
-            for i in range(0, len(ordered_tbs), x):
-                group_tbs = ordered_tbs[i:i+x]
-                group_locality = self._compute_partition_locality(group_tbs)
-                group = TBGroup(group_tbs, p_idx, group_locality)
-                partitions.append(group)
-                sm_assignments[p_idx % n_sms].append(group)
-            
+
+            # One TB group per partition. Its id is its position in
+            # `partitions`, which is the index the exporter and GPGPU-Sim use.
+            p_idx = len(partitions)
+            group = TBGroup(ordered_tbs, p_idx,
+                            self._compute_partition_locality(ordered_tbs))
+            partitions.append(group)
+            sm_assignments[p_idx % n_sms].append(group)   # p_idx < k <= n_sms
+
             tb_schedule.extend(ordered_tbs)
             for tb in ordered_tbs:
                 partition_assignment[tb] = p_idx
-        
+
+        sizes = [len(g) for g in partitions]
+        print(f"KWAY_TS: n_tbs={n_tbs}, n_sms={n_sms}, k={k}, "
+              f"TBs per partition: min={min(sizes, default=0)} "
+              f"max={max(sizes, default=0)}")
+
         # Compute locality metrics
-        intra_locality = sum(self._compute_partition_locality(list(p)) 
-                            for p in metis_partitions)
+        intra_locality = sum(g.total_locality for g in partitions)
         total_locality = self.graph.get_total_edge_weight()
         inter_cut = total_locality - intra_locality
         

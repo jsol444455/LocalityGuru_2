@@ -16,6 +16,13 @@ import argparse
 
 param_dict = dict()
 
+# Set from the command line of this script or of locality_map_coalescing.py
+# (see file_open): scalar kernel parameters ("--param NAME=VALUE") and the
+# PTX file to analyse ("--ptx", default original/<name>.ptx).
+launch_params = dict()
+ptx_path = None
+_matrices_written = set()
+
 '''
 tidx_list = list() #list(range(0,512))
 tidy_list = list()
@@ -30,7 +37,7 @@ def ADD(a,b):
 def SUB(a,b):
     return a-b
 def MADLO(a,b):
-    return (( a )&0x0000000011111111) + b #(( a )&0x0000000011111111) + b
+    return (( a )&0xFFFFFFFF) + b  # mad.lo keeps the low 32 bits of the product
 def MUL(a,b):
     return a * b
 def SHL(a,b):
@@ -1459,8 +1466,13 @@ def compute_addresses_for_single_ldglobal(formular, kernel_info, bb_graph,
 # file_open - Main Entry Point
 # ============================================================================
 
-def file_open(file_name):
+def _legacy_file_open(file_name):
     """
+    Previous locality-matrix computation, kept for comparison: evaluates each
+    ld.global formula once per thread (one loop iteration; idle threads are
+    only filtered when the basic blocks were recognised).  Selected with
+    LOCALITYGURU_LEGACY_TRACER=1; file_open() below is the default.
+
     FIXED: Modified to load and use predicate information
     """
     global ctaid_map, ctaidx, ctaidy, ntidx, ntidy  # ← ADD THIS LINE
@@ -1643,6 +1655,103 @@ def file_open(file_name):
 
 
 # ============================================================================
+# Locality matrices by executing the kernel's PTX (default)
+# ============================================================================
+def _find_ptx(base_name):
+    candidates = ([ptx_path] if ptx_path else []) + [
+        os.path.join("original", base_name + ".ptx"), base_name + ".ptx"]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    print(f"[Error] PTX file for {base_name} not found (looked for "
+          f"{', '.join(candidates)}); give its path with --ptx")
+    sys.exit(1)
+
+
+def file_open(file_name):
+    """
+    Write the TB locality matrix and heatmap of every kernel in the PTX file
+    behind file_name (syntax_tree/<name>/<name>_st.json, as before):
+
+        img/<app>/<kernel>_<gx>-<gy>_matrix.json   entry [j][i], j > i
+        img/<app>/<kernel>_<gx>-<gy>.png
+
+    Entry [j][i] is the number of distinct addresses that TB i and TB j both
+    read with ld.global (LocalityGuru Algorithm 2).  The addresses come from
+    executing the kernel's PTX for every thread of the grid (ctaidx x ctaidy
+    TBs of ntidx x ntidy threads, ptx_exec.py), so every loop iteration is
+    counted, threads that branch around a load (idle threads) are not, and
+    [reg+offset] addresses are exact.  Scalar kernel parameters that affect
+    addresses or branches must be given in launch_params (--param).
+
+    The PTX is original/<name>.ptx unless ptx_path (--ptx) is set.
+    LOCALITYGURU_LEGACY_TRACER=1 selects the previous computation.
+    """
+    if os.environ.get("LOCALITYGURU_LEGACY_TRACER") == "1":
+        return _legacy_file_open(file_name)
+    if file_name in _matrices_written:  # one call covers all kernels
+        print(f"[Info] Locality matrices for {file_name} already written")
+        return
+    try:
+        from . import ptx_exec
+    except ImportError:
+        import ptx_exec
+    base_name = os.path.basename(file_name)
+    for suffix in ("_st.json", ".json"):
+        if base_name.endswith(suffix):
+            base_name = base_name[:-len(suffix)]
+            break
+    ptx = _find_ptx(base_name)
+    grid = (int(ctaidx), int(ctaidy), 1)
+    block = (int(ntidx), int(ntidy), 1)
+    print(f"[Info] Executing {ptx} for {grid[0]}x{grid[1]} TBs of "
+          f"{block[0]}x{block[1]} threads")
+    try:
+        results = ptx_exec.analyze_ptx(ptx, grid, block, launch_params)
+    except ptx_exec.PTXAnalysisError as e:
+        print(f"[Error] {e}")
+        sys.exit(1)
+    if not os.path.isdir(f"img/{app_name}"):
+        os.makedirs(f"img/{app_name}")
+    for kernel_name, res in results.items():
+        print(f"\n{'='*60}")
+        print(f"Processing kernel: {kernel_name}")
+        print(f"{'='*60}")
+        st = res["stats"]
+        print(f"[Info] {st['ld_global_executed']} ld.global executions, "
+              f"{st['addresses_per_tb_min']}-{st['addresses_per_tb_max']} "
+              f"distinct addresses per TB")
+        if st["ld_global_skipped"]:
+            print(f"[Warning] {st['ld_global_skipped']} ld.global executions "
+                  f"skipped: their addresses depend on loaded data")
+        kernel_map = ptx_exec.lower_triangle(res["matrix"])
+        num_tbs = len(kernel_map)
+        shown = hidden = 0
+        for i in range(num_tbs):
+            for j in range(i + 1, num_tbs):
+                if kernel_map[j][i] > 0:
+                    if shown < 2000:
+                        print(f"  TB {i} <-> TB {j}: {kernel_map[j][i]} shared addresses")
+                        shown += 1
+                    else:
+                        hidden += 1
+        if hidden:
+            print(f"  ... and {hidden} more TB pairs that share addresses")
+        print(f"[file_open] ✓ Locality matrix computation complete for {kernel_name}")
+        np_kernel_map = np.array(kernel_map)
+        dp_kernel_map = pd.DataFrame(np_kernel_map)
+        sns.heatmap(dp_kernel_map, cmap="OrRd")
+        plt.savefig(f"img/{app_name}/{kernel_name}_{ctaidx}-{ctaidy}.png")
+        matrix_file = f"img/{app_name}/{kernel_name}_{ctaidx}-{ctaidy}_matrix.json"
+        with open(matrix_file, 'w') as f:
+            json.dump(kernel_map, f)
+        print(f"[Info] Saved locality matrix to {matrix_file}")
+        plt.clf()
+        print(f"[Info] Saved locality heatmap to img/{app_name}/{kernel_name}_{ctaidx}-{ctaidy}.png")
+    _matrices_written.add(file_name)
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -1650,10 +1759,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PTX Locality Analysis")
     parser.add_argument('-f', '--file', required=True, help="Base filename (e.g., vector_256_1_256_1)")
     parser.add_argument('-d', '--dir', default='syntax_tree/', help="Syntax tree directory")
+    parser.add_argument('--param', action='append', default=[],
+                        help="scalar kernel parameter NAME=VALUE (repeatable); NAME is "
+                             "the full name or its 'param_N' suffix")
+    parser.add_argument('--ptx', default=None,
+                        help="PTX file to analyse (default: original/<file>.ptx)")
     
     args = parser.parse_args()
     
     global app_name, tidx, tidy, ctaidx, ctaidy, ntidx, ntidy
+    for item in args.param:
+        if "=" not in item:
+            parser.error(f"--param expects NAME=VALUE, got {item!r}")
+        launch_params[item.split("=", 1)[0].strip()] = item.split("=", 1)[1].strip()
+    ptx_path = args.ptx
     
     # Parse filename to get dimensions
     base_name = args.file.replace('.ptx', '')
